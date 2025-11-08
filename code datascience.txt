@@ -1,0 +1,237 @@
+"""
+AI622 – Checkpoint 3 (Distributed EDA with Dask) — Kvasir
+Covers: Dask delayed/bag/dataframe/array, lazy eval, local cluster, scheduler choice,
+out-of-core scaling, Parquet output, plots, and HTML report.
+"""
+
+# -------------------- Imports & Cluster --------------------
+import os, cv2, math, json, shutil, random
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+import dask, dask.bag as db, dask.dataframe as dd, dask.array as da
+from dask import delayed, compute
+from dask.distributed import Client, LocalCluster
+
+# --- Create a local distributed Dask cluster (lectures recommend this) ---
+# You can toggle processes vs. threads per workload characteristics.  :contentReference[oaicite:2]{index=2}
+cluster = LocalCluster(processes=True, n_workers=4, threads_per_worker=2)
+client  = Client(cluster)
+print(client)  # Optional: view dashboard URL
+
+# -------------------- Config --------------------
+DATASET_ROOT = r"/path/to/kvasir/root"  # <-- CHANGE THIS
+OUTPUT_DIR   = Path("outputs_dask"); OUTPUT_DIR.mkdir(exist_ok=True)
+(OUTPUT_DIR / "quarantine").mkdir(exist_ok=True, parents=True)
+VALID_EXTS   = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+random.seed(42); np.random.seed(42)
+
+# -------------------- Helpers (from your feature plan) --------------------
+def safe_imread(path: str):
+    """Robust image read (works with non-ASCII paths, returns None if corrupt)."""
+    try:
+        with open(path, "rb") as f:
+            arr = np.frombuffer(f.read(), dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        return img
+    except Exception:
+        return None
+
+def image_entropy_gray(gray: np.ndarray) -> float:
+    """Shannon entropy on grayscale histogram."""
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+    p = hist / (gray.size + 1e-12)
+    p = p[p > 0]
+    return float(-(p * np.log2(p)).sum())
+
+def hue_circular_mean(h_channel: np.ndarray) -> float:
+    """Circular mean for OpenCV hue (0..179) as per color wheel."""
+    angles = h_channel.astype(np.float32) * (2*np.pi / 180.0)
+    C, S = np.cos(angles).mean(), np.sin(angles).mean()
+    ang = math.atan2(S, C)
+    if ang < 0: ang += 2*np.pi
+    return float(ang * (180.0 / (2*np.pi)))
+
+def extract_features_one(path: str, label: str):
+    """
+    Single-image feature extraction: brightness, contrast, saturation,
+    hue (circular), entropy, edge_density + dims.
+    Returns dict or None for corrupt images.
+    """
+    img = safe_imread(path)
+    if img is None:
+        # Move corrupt file for audit; keep going (distributed robustness)
+        try:
+            shutil.copy2(path, OUTPUT_DIR / "quarantine" / Path(path).name)
+        except Exception:
+            pass
+        return None
+
+    hgt, wdt = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    H, S, V = cv2.split(hsv)
+
+    # Brightness/contrast
+    brightness = float(gray.mean())
+    contrast   = float(gray.std())
+
+    # Saturation & Hue (circular mean per your plan)
+    saturation = float(S.mean())
+    hue_circ   = hue_circular_mean(H)
+
+    # Entropy (texture/complexity)
+    entropy    = image_entropy_gray(gray)
+
+    # Edge density (Canny; thresholds from luminance median)
+    med = float(np.median(V))
+    low, high = int(max(0, 0.66*med)), int(min(255, 1.33*med))
+    edges = cv2.Canny(gray, low, high, L2gradient=True)
+    edge_density = float(edges.mean() / 255.0)
+
+    return {
+        "filepath": path,
+        "label": label,
+        "height": int(hgt),
+        "width":  int(wdt),
+        "brightness": brightness,
+        "contrast":   contrast,
+        "saturation": saturation,
+        "hue_circular": hue_circ,
+        "entropy": entropy,
+        "edge_density": edge_density,
+    }
+
+# -------------------- Build delayed pipeline (lazy) --------------------
+def enumerate_files(root: str):
+    """Collect (path,label) pairs for class-per-folder layout."""
+    pairs = []
+    for cls_dir in Path(root).iterdir():
+        if cls_dir.is_dir():
+            label = cls_dir.name
+            for fp in cls_dir.rglob("*"):
+                if fp.is_file() and fp.suffix.lower() in VALID_EXTS:
+                    pairs.append((str(fp), label))
+    return pairs
+
+pairs = enumerate_files(DATASET_ROOT)
+print(f"Found {len(pairs)} candidate files.")
+
+# Build delayed tasks (lazy graph) — per lecture on dask.delayed :contentReference[oaicite:3]{index=3}
+delayed_rows = [delayed(extract_features_one)(p, l) for p, l in pairs]
+
+# Compute in parallel (use processes by default; can override scheduler) :contentReference[oaicite:4]{index=4}
+results = dask.compute(*delayed_rows)    # equivalent: compute(..., scheduler='processes')
+rows    = [r for r in results if r is not None]
+
+# Convert to Dask DataFrame (partitions = CPU count by default)
+pdf = pd.DataFrame(rows)
+if pdf.empty:
+    raise SystemExit("No valid images processed. Check DATASET_ROOT.")
+ddf = dd.from_pandas(pdf, npartitions=os.cpu_count())
+
+# -------------------- Out-of-core exports (CSV + Parquet) --------------------
+# (Lectures recommend Parquet for speed; CSV kept for compatibility) :contentReference[oaicite:5]{index=5}
+FEATURES = ["brightness","contrast","saturation","hue_circular","entropy","edge_density"]
+
+# Min–Max scaling on Dask DataFrame
+mins = ddf[FEATURES].min().compute()
+maxs = ddf[FEATURES].max().compute()
+for c in FEATURES:
+    ddf[c+"_minmax"] = (ddf[c] - mins[c]) / (maxs[c] - mins[c])
+
+# Single-file CSV and Parquet
+csv_path = OUTPUT_DIR / "kvasir_features_dask.csv"
+parq_dir = OUTPUT_DIR / "kvasir_features_parquet"
+ddf.to_csv(str(csv_path), single_file=True, index=False)
+ddf.to_parquet(str(parq_dir), engine="pyarrow", overwrite=True)
+
+# -------------------- Distributed EDA (summaries + plots) --------------------
+# 1) Class distribution
+class_counts = ddf["label"].value_counts().compute()
+
+plt.figure()
+plt.bar(class_counts.index, class_counts.values)
+plt.title("Class Distribution (Dask)")
+plt.xlabel("Class"); plt.ylabel("Count")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout(); plt.savefig(OUTPUT_DIR / "class_distribution.png", dpi=150); plt.close()
+
+# 2) Dimensions hist (sample to avoid huge memory draw for bins, then .compute())
+for col in ["width","height"]:
+    col_vals = ddf[col].sample(frac=1.0).compute()  # full; change to 0.3 for very large sets
+    plt.figure(); plt.hist(col_vals, bins=30)
+    plt.title(f"Image {col.capitalize()}s"); plt.xlabel(col); plt.ylabel("Frequency")
+    plt.tight_layout(); plt.savefig(OUTPUT_DIR / f"hist_{col}.png", dpi=150); plt.close()
+
+# 3) Per-feature boxplots by class (compute to pandas for plotting)
+for c in FEATURES:
+    tmp = ddf[["label", c]].compute()
+    order = sorted(tmp["label"].unique())
+    data_by_class = [tmp[tmp["label"]==lbl][c].values for lbl in order]
+    plt.figure()
+    plt.boxplot(data_by_class, labels=order)
+    plt.title(f"{c} by Class"); plt.xlabel("Class"); plt.ylabel(c)
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout(); plt.savefig(OUTPUT_DIR / f"box_{c}.png", dpi=150); plt.close()
+
+# 4) Correlation matrix (Pearson)
+corr = ddf[FEATURES].corr().compute()
+plt.figure()
+plt.imshow(corr.values, vmin=-1, vmax=1)
+plt.colorbar()
+plt.xticks(range(len(FEATURES)), FEATURES, rotation=45, ha="right")
+plt.yticks(range(len(FEATURES)), FEATURES)
+plt.title("Feature Correlation (Dask)")
+plt.tight_layout(); plt.savefig(OUTPUT_DIR / "corr_matrix.png", dpi=150); plt.close()
+
+# 5) Pairwise scatter (downsample for visualization)
+sample_pdf = ddf[FEATURES].sample(frac=0.25, random_state=42).compute()
+pd.plotting.scatter_matrix(sample_pdf, figsize=(10,10), diagonal="hist")
+plt.suptitle("Scatter Matrix (25% sample)")
+plt.tight_layout(); plt.savefig(OUTPUT_DIR / "scatter_matrix.png", dpi=150); plt.close()
+
+# -------------------- Quality summary + HTML report --------------------
+summary = {
+    "total_images_scanned": int(len(pairs)),
+    "valid_images": int(ddf.shape[0].compute()),
+    "classes": {k: int(v) for k,v in class_counts.to_dict().items()},
+    "feature_summary": ddf[FEATURES].describe().compute().to_dict(),
+}
+with open(OUTPUT_DIR / "qc_summary.json", "w") as f:
+    json.dump(summary, f, indent=2)
+
+html = f"""
+<html><head><meta charset="utf-8"><title>Checkpoint 3: Dask EDA (Kvasir)</title></head>
+<body>
+<h1>Distributed EDA with Dask — Kvasir</h1>
+<p>Cluster: {client}</p>
+<ul>
+  <li>Total files: {summary['total_images_scanned']}</li>
+  <li>Valid images: {summary['valid_images']}</li>
+  <li>Class count: {summary['classes']}</li>
+</ul>
+<h2>Key Figures</h2>
+<img src="class_distribution.png" width="800">
+<img src="hist_width.png" width="800">
+<img src="hist_height.png" width="800">
+<img src="corr_matrix.png" width="800">
+<img src="scatter_matrix.png" width="800">
+<h2>Notes</h2>
+<ul>
+  <li>Features: brightness, contrast, saturation, hue (circular), entropy, edge density.</li>
+  <li>Min–Max scaled copies exported for dashboards (*_minmax).</li>
+  <li>Parquet export provided (fast, columnar) in addition to single-file CSV.</li>
+</ul>
+</body></html>
+"""
+(OUTPUT_DIR / "eda_report.html").write_text(html, encoding="utf-8")
+
+print("\nDONE. Outputs in:", OUTPUT_DIR.resolve())
+print(" - kvasir_features_dask.csv")
+print(" - kvasir_features_parquet/")
+print(" - class_distribution.png, hist_width.png, hist_height.png")
+print(" - box_*.png, corr_matrix.png, scatter_matrix.png")
+print(" - qc_summary.json, eda_report.html")
